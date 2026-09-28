@@ -625,15 +625,24 @@ router.put('/:collection/:id', (req, res) => {
     if (refErr) return res.status(400).json({ error: refErr });
   }
 
-  Object.assign(item, sanitize(collection, req.body));
+  // 先得到「拟更新后的完整字段」，所有冲突检查都针对它进行；
+  // 检查通过前不得改动内存中的现存记录（否则返回 4xx 后内存会留下脏状态，
+  // 后续查询 / 校验会读到串改数据，下一次成功保存还可能把脏状态写入数据文件）。
+  const updates = sanitize(collection, req.body);
 
   if (collection === 'edges') {
+    // 无向连接：正、反方向视为同一对端点；除自身外与任一条现存连接同对即冲突
     const dup = data.edges.some(
-      (e) => e.id !== id && ((e.a === item.a && e.b === item.b) || (e.a === item.b && e.b === item.a))
+      (e) =>
+        e.id !== id &&
+        ((e.a === updates.a && e.b === updates.b) || (e.a === updates.b && e.b === updates.a))
     );
-    if (dup) return res.status(409).json({ error: '两个区域之间已存在连接' });
+    if (dup) {
+      return res.status(409).json({ error: '两个区域之间已存在连接' });
+    }
   }
 
+  Object.assign(item, updates);
   store.save();
   res.json(item);
 });

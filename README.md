@@ -8,6 +8,41 @@
 
 技术栈：Node.js + Express + 原生 HTML/CSS/JavaScript（无任何前端构建步骤）。
 
+## 变动说明（连接编辑提交边界修复）
+
+`PUT /api/edges/:id` 过去在**端点重复检查之前**就把新端点 / 耗时 / 容量 / 封闭时段写入了内存中的现存记录，重复检查命中而返回 409 时，脏状态已经留在内存里：随后的 `GET /api/data` 与 `GET /api/validate`（走位校验）会读到被串改的连接，而**下一次任意成功保存**还会把这份脏状态整体写入数据文件。
+
+现已收紧提交边界（HTTP API、页面编辑流程与 Compose 启动方式均不变）：
+
+- **按拟更新后的完整连接判重**：先用请求体构造「更新后字段」再判重，检查通过前不改动任何现存记录；
+- **正反方向视为同一对**：无向连接 `(A,B)` 与 `(B,A)` 是同一对端点，与除自身外的任一条现存连接同对即返回 **409**；
+- **冲突时零副作用**：409 时被编辑连接（含端点、耗时、容量、封闭时段）及其它数据的**内存状态与数据文件都保持原样**，错误文案仍为「两个区域之间已存在连接」；
+- **合法编辑一次生效**：检查通过后一次 `Object.assign` + 单次落盘，走位校验随即按新连接（含新耗时 / 容量 / 封闭时段）重算。
+
+调用示例（以下 ID 取自内置示例数据）：
+
+```bash
+# 合法编辑：改耗时 / 容量 / 封闭时段（端点不变）→ 200，随后走位校验按新连接重算
+curl -X PUT http://localhost:3000/api/edges/edge-wingr-center \
+  -H 'Content-Type: application/json' \
+  -d '{"a":"area-wing-r","b":"area-center","seconds":7,"capacity":3,"closures":[{"start":20,"end":25}]}'
+
+# 非法编辑：端点改成另一条现存连接（edge-wingl-center = 侧台左↔舞台中央）→ 409
+# 同时夹带的 seconds/capacity/closures 修改不会生效，内存与数据文件均保持原样
+curl -i -X PUT http://localhost:3000/api/edges/edge-wingr-center \
+  -H 'Content-Type: application/json' \
+  -d '{"a":"area-wing-l","b":"area-center","seconds":99,"capacity":9,"closures":[{"start":1,"end":2}]}'
+# HTTP/1.1 409 Conflict
+# {"error":"两个区域之间已存在连接"}
+
+# 反方向同样视为同一对端点，结果完全一致
+curl -i -X PUT http://localhost:3000/api/edges/edge-wingr-center \
+  -H 'Content-Type: application/json' \
+  -d '{"a":"area-center","b":"area-wing-l","seconds":99,"capacity":9,"closures":[]}'
+```
+
+回归测试见 `test/edge-update.test.js`（`npm test`，使用独立临时数据目录，不影响 `data/`）。
+
 ## CSV 引号规则（导入与复盘共用同一个解析器）
 
 「排练数据 CSV 导入」与「现场走位复盘」上传的 UTF-8 CSV（可带 BOM，支持 CRLF / LF 换行）由同一个严格解析器处理。引号按其在字段中的位置区分三种状态，**任何非法引号都判定为文件结构错误**，导入预览 / 提交与复盘分析 / 报告**一律直接拒绝（HTTP 400）、不继续解析任何一行**，不会把含错内容当作有效姓名或数据：
@@ -338,7 +373,7 @@ npm start
 | POST | `/api/replay/report` | 下载本次复盘 Markdown（**只读、不写库**）：请求体 `{ csv }`，服务端按原始 CSV 重新计算后返回 `text/markdown; charset=utf-8` 附件（含汇总、CSV 逐行解析问题、每位演员配对 / 漏项 / 多项明细）；CSV 非法（含上述非法引号结构错误）时同样返回 400 |
 | GET | `/api/sightlines` | 观众视线遮挡检查：对每位观众点 × 每个舞台目标精确裁剪视线段与各矩形投影的相交参数区间（边界接触算相交、视线高度等于遮挡物高度算被挡）。返回 `pairs`（逐对结果：`status` 为 `clear`/`blocked`、`firstObstacle`（最小进入参数的首挡物）、`intersections`（各遮挡物的进入 / 退出参数，含精确分数 `num/den` 与 6 位小数 `t`、是否遮挡）、`clearable`、`requiredTargetHeight`（严格越过全部相交遮挡物的最小整数目标高度，无法解决时为 `null`）与 `raiseBy`（建议抬高量））与 `summary`（观众点 / 目标 / 遮挡物 / 视线对 / 通视 / 被挡 / 无法抬高解决计数） |
 | GET | `/api/rigging` | 吊挂布景载荷核算：逐吊挂件按力矩平衡分担（分数精确值），逐吊点按半开时段 `[起, 止)` 汇总载荷（同秒结束先于开始）。返回 `points`（按横坐标升序：`peak` 峰值载荷、`peakInterval` 峰值首次出现时段、`overloaded` 与 `intervals` 合并后的超额区间——含起止秒数、持续秒数、区间峰值 `peakLoad` 与超额量 `excess`，载荷均以 `{ num, den, kg }` 给出精确分子分母与 2 位小数值）、`items`（逐件左右吊点分担明细）与 `summary`（吊点 / 吊挂件 / 超额吊点 / 超额区间计数） |
-| POST / PUT / DELETE | `/api/areas`、`/api/edges`、`/api/actors`、`/api/cues`、`/api/audiencePoints`、`/api/targets`、`/api/obstacles`、`/api/rigPoints`、`/api/rigItems`（`/:id`） | 九类资源的增改删；删除被吊挂件引用的吊点返回 409，修改吊点横坐标破坏吊挂件重心约束返回 400 |
+| POST / PUT / DELETE | `/api/areas`、`/api/edges`、`/api/actors`、`/api/cues`、`/api/audiencePoints`、`/api/targets`、`/api/obstacles`、`/api/rigPoints`、`/api/rigItems`（`/:id`） | 九类资源的增改删；删除被吊挂件引用的吊点返回 409，修改吊点横坐标破坏吊挂件重心约束返回 400。连接（`edges`）按**拟更新后的完整连接**判重：无向连接正、反方向视为同一对端点，创建时同对已存在返回 409；更新时与除自身外的现存连接同对返回 **409 且不写入**——冲突时被编辑连接（端点 / 耗时 / 容量 / 封闭时段）及其它数据的内存状态与数据文件均保持原样；合法更新一次落盘，走位校验按新连接重算 |
 
 `edges` 的创建 / 更新请求体示例：
 
@@ -355,6 +390,8 @@ npm start
 `closures` 可省略（等价于无封闭）；每段需满足 `0 ≤ start < end` 且为整数秒，否则返回 400。
 
 `capacity`（通道容量）可省略：创建时缺省为 `1`，更新时不传则保留原值；需为 `1～10` 的整数秒，否则返回 400。旧数据文件中没有该字段的连接按容量 1 处理，完全兼容。
+
+更新连接端点（`PUT /api/edges/:id`）时，服务端按**拟更新后的完整连接**判重：无向连接正、反方向视为同一对端点，若与除自身之外的任一条现存连接同对，返回 409「两个区域之间已存在连接」，且**本次请求的全部字段（端点 / 耗时 / 容量 / 封闭时段）都不写入**，内存与数据文件保持冲突前原样；仅颠倒自身端点顺序（仍是同一对区域）不算重复。端点不变、只改耗时 / 容量 / 封闭时段为合法更新，保存后单次落盘并即时重算走位校验。
 
 `cues` 的创建 / 更新请求体示例：
 
@@ -451,6 +488,7 @@ npm start
 │   └── routes.js        # REST API 路由与入参校验（含依赖增删与成环拒绝、换装任务登记 / 删除与级联清理、基线保存 / 覆盖 / 清除、疏散快照、只读复盘分析 / 报告、视线遮挡检查与吊挂载荷核算）
 ├── public/              # 前端（原生 HTML/CSS/JS，含换装核查结果区、视线遮挡 SVG 平面图与吊挂载荷核算结果区）
 ├── seed/sample-data.json# 内置示例数据（含封闭时段演示、换装核查演示、视线遮挡演示与吊挂载荷演示）
+├── test/                # 回归测试（node --test；连接更新 409 提交边界等，使用独立临时数据目录）
 ├── Dockerfile
 └── docker-compose.yml
 ```
