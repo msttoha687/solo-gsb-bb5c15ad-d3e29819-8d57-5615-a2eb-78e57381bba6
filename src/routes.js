@@ -584,6 +584,11 @@ router.get('/rigging', (req, res) => {
 
 const COLLECTIONS = ['areas', 'edges', 'actors', 'cues', 'audiencePoints', 'targets', 'obstacles', 'rigPoints', 'rigItems'];
 
+/** 两条连接的端点对是否相同（无向：a-b 与 b-a 视为同一对） */
+function sameEdgePair(x, y) {
+  return (x.a === y.a && x.b === y.b) || (x.a === y.b && x.b === y.a);
+}
+
 router.post('/:collection', (req, res) => {
   const { collection } = req.params;
   if (!COLLECTIONS.includes(collection)) return res.status(404).json({ error: '未知资源类型' });
@@ -597,9 +602,7 @@ router.post('/:collection', (req, res) => {
   if (collection === 'edges' && item.capacity === undefined) item.capacity = 1; // 通道容量默认 1
 
   if (collection === 'edges') {
-    const dup = data.edges.some(
-      (e) => (e.a === item.a && e.b === item.b) || (e.a === item.b && e.b === item.a)
-    );
+    const dup = data.edges.some((e) => sameEdgePair(e, item));
     if (dup) return res.status(409).json({ error: '两个区域之间已存在连接，可直接编辑耗时' });
   }
 
@@ -625,14 +628,19 @@ router.put('/:collection/:id', (req, res) => {
     if (refErr) return res.status(400).json({ error: refErr });
   }
 
-  Object.assign(item, sanitize(collection, req.body));
+  const update = sanitize(collection, req.body);
 
   if (collection === 'edges') {
-    const dup = data.edges.some(
-      (e) => e.id !== id && ((e.a === item.a && e.b === item.b) || (e.a === item.b && e.b === item.a))
-    );
-    if (dup) return res.status(409).json({ error: '两个区域之间已存在连接' });
+    // 端点判重必须按「拟更新后的完整连接」判断：先与现有记录合并出候选对象，
+    // 再和其他连接做无向比对（a-b 与 b-a 视为同一对）。冲突时在任何内存写入之前
+    // 返回 409——该连接及其他数据的内存状态与数据文件都保持原样，不会被后续保存带出。
+    const candidate = { ...item, ...update };
+    if (data.edges.some((e) => e.id !== id && sameEdgePair(e, candidate))) {
+      return res.status(409).json({ error: '两个区域之间已存在连接' });
+    }
   }
+
+  Object.assign(item, update);
 
   store.save();
   res.json(item);
